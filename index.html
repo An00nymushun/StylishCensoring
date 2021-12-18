@@ -1,0 +1,222 @@
+<!doctype html>
+
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>K-Means mosaic</title>
+    <script src="kmeans.js"></script>
+</head>
+
+<body>
+    <input type="file" id="imageinput" accept="image/png, image/jpeg">
+    <button id="clearbutton">Clear</button>
+    <canvas id="outputcanvas" style="max-width: 100%;"></canvas>
+
+    <script>
+class ImageDataSlice {
+    /** @param {ImageData} imageData */
+    constructor(imageData, sliceX, sliceY, sliceWidth, sliceHeight) {
+        const imageDataWidth = imageData.width;
+        const imageDataHeight = imageData.height;
+        const data = new Uint32Array(imageData.data.buffer, imageData.data.byteOffset, imageData.data.byteLength / 4);
+
+        let sliceXEnd = Math.min(sliceX + sliceWidth, imageDataWidth);
+        let sliceYEnd = Math.min(sliceY + sliceHeight, imageDataHeight);
+        sliceX = Math.max(sliceX, 0);
+        sliceY = Math.max(sliceY, 0);
+        sliceWidth = sliceXEnd - sliceX;
+        sliceHeight = sliceYEnd - sliceY;
+        const length = sliceWidth * sliceHeight;
+
+        const getIndex = (i) => {
+            let y = Math.floor(i / sliceWidth)
+            let x = i % sliceWidth;
+
+            x += sliceX;
+            y += sliceY;
+            return y * imageDataWidth + x;
+        };
+
+        /*return new Proxy([], {
+            get(target, key) {
+                const keyNum = Number(key);
+                if(isFinite(keyNum)) {
+                    return data[getIndex(keyNum)];
+                }
+                else if(key === 'length') {
+                    return length;
+                }
+                return target[key];
+            },
+            set(target, key, value) {
+                const keyNum = Number(key);
+                if(isFinite(keyNum)) {
+                    return data[getIndex(keyNum)] = value;
+                }
+                return Reflect.set(target, key, value);
+            }
+        });*/
+
+        return {
+            get(index) {
+                return data[getIndex(index)];
+            },
+
+            length,
+
+            set(index, value) {
+                data[getIndex(index)] = value;
+            }
+        };
+    }
+}
+
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+imageinput.onchange = () => {
+    /** @type File */
+    const imagefile = imageinput.files[0];
+    if(imagefile === undefined) return;
+
+    const imageUrl = URL.createObjectURL(imagefile);
+    const image = new Image();
+    image.onload = async () => {
+        URL.revokeObjectURL(imageUrl);
+
+        /** @type HTMLCanvasElement */
+        const canvas = outputcanvas;
+        const width = image.width;
+        const height = image.height;
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(image, 0, 0);
+        const imageData = ctx.getImageData(0, 0, width, height);
+        const originalImageData = new ImageData(new Uint8ClampedArray(imageData.data), width);
+
+        const chunkSize = Math.min(width, height) / 80;
+        for (let y = 0; y < height; y += chunkSize) {
+            const roundedY = Math.round(y);
+            const roundedNextY = Math.round(y + chunkSize);
+            for (let x = 0; x < width; x += chunkSize) {
+                const roundedX = Math.round(x);
+                const roundedNextX = Math.round(x + chunkSize);
+
+                const imageDataSlice = new ImageDataSlice(imageData, roundedX, roundedY, roundedNextX - roundedX, roundedNextY - roundedY);
+
+                const clusters = kmeans(imageDataSlice, 5, 10);
+                let maxWeight = -1;
+                let newFill;
+                for (const cluster of clusters) {
+                    if(cluster.weight > maxWeight) {
+                        maxWeight = cluster.weight;
+                        newFill = cluster.color;
+                    }
+                }
+
+                newFill = ((newFill & 0xFEFEFEFE) >>> 1) + ((newFill & 0xFCFCFCFC) >>> 2);
+
+                const imageDataSliceLength = imageDataSlice.length;
+                for (let i = 0; i < imageDataSliceLength; i++) {
+                    let originalColor = imageDataSlice.get(i);
+                    originalColor = (originalColor & 0xFCFCFCFC) >>> 2
+                    imageDataSlice.set(i, (newFill + originalColor) | 0);
+                    //imageDataSlice.set(i, newFill);
+                }
+
+                /*const imageBytes = imageData.data;
+                const yOffset = width * roundedY * 4;
+                for (let i = yOffset + roundedX * 4; i < yOffset + roundedNextX * 4; i += 4) {
+                    imageBytes[i] += 100;
+                    imageBytes[i + 1] += 100;
+                    imageBytes[i + 2] += 100;
+                }*/
+            }
+            
+            ctx.putImageData(imageData, 0, 0);
+            await wait(0);
+        }
+
+        ctx.save();
+        ctx.translate(0.5, 0.5);
+
+        ctx.lineWidth = chunkSize / 10;
+        ctx.strokeStyle = "rgba(255,255,255,0.5)";
+        ctx.beginPath();
+        for (let y = chunkSize; y < height; y += chunkSize) {
+            const roundedY = Math.round(y);
+            ctx.moveTo(0, roundedY);
+            ctx.lineTo(width, roundedY);
+        }
+        for (let x = chunkSize; x < width; x += chunkSize) {
+            const roundedX = Math.round(x);
+            ctx.moveTo(roundedX, 0);
+            ctx.lineTo(roundedX, height);
+        }
+        ctx.stroke();
+        ctx.restore();
+
+        const maskCanvas = document.createElement('canvas');
+        maskCanvas.width = width;
+        maskCanvas.height = height;
+        const maskCtx = maskCanvas.getContext('2d');
+
+        const censoringCanvas = document.createElement('canvas');
+        censoringCanvas.width = width;
+        censoringCanvas.height = height;
+        const censoringCtx = censoringCanvas.getContext('2d');
+        censoringCtx.globalCompositeOperation = 'destination-in';
+        
+        const censoredImageData = ctx.getImageData(0, 0, width, height);
+
+        function getCursorPosition(event, width, height) {
+            const rect = event.target.getBoundingClientRect();
+            const x = (event.clientX - rect.left) / rect.width * width;
+            const y = (event.clientY - rect.top) / rect.height * height;
+            return [x, y];
+        }
+
+        function draw(event) {
+            const [x, y] = getCursorPosition(event, width, height);
+
+            maskCtx.fillStyle = "#FFF";
+            maskCtx.beginPath();
+            maskCtx.arc(x, y, chunkSize, 0, 2 * Math.PI);
+            maskCtx.fill();
+
+            ctx.putImageData(originalImageData, 0, 0);
+
+            censoringCtx.putImageData(censoredImageData, 0, 0);
+
+            censoringCtx.filter = `blur(${chunkSize}px)`;
+            censoringCtx.drawImage(maskCanvas, 0, 0);
+            censoringCtx.filter = 'none';
+
+            ctx.globalCompositeOperation = 'source-atop';
+            ctx.drawImage(censoringCanvas, 0, 0);
+        }
+
+        let mousedown = false;
+
+        canvas.onmousedown = (event) => {
+            mousedown = true;
+            draw(event);
+        }
+        canvas.onmousemove = (event) => {
+            if(mousedown) draw(event);
+        }
+
+        window.addEventListener('mouseup', () => mousedown = false);
+        
+        clearbutton.onclick = () => {
+            maskCtx.clearRect(0, 0, width, height);
+            ctx.putImageData(originalImageData, 0, 0);
+        }
+    };
+    image.src = imageUrl;
+}
+    </script>
+</body>
+</html>
